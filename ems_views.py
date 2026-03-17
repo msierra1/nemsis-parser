@@ -360,11 +360,17 @@ def build_view_sql(conn: PGConn, view_name: str) -> tuple[str, list[str]]:
         # ---------- explicit columns (curated) ----------
         cur.execute(
             """
-            WITH labels AS (
-            SELECT DISTINCT
+            WITH fd_dedup AS (
+            SELECT DISTINCT ON (elementnumber) elementnumber, elementname
+            FROM fielddefinitions
+            ORDER BY elementnumber
+            ),
+            labels AS (
+            SELECT DISTINCT ON (COALESCE(e.elementnumber, e.xmlname))
                 COALESCE(e.elementnumber, e.xmlname) AS elementnumber,
                 NULLIF(e.elementname,'')             AS xsd_elementname
             FROM XSD_Elements e
+            ORDER BY COALESCE(e.elementnumber, e.xmlname)
             )
             SELECT
             vc.elementnumber,
@@ -378,8 +384,8 @@ def build_view_sql(conn: PGConn, view_name: str) -> tuple[str, list[str]]:
             UPPER(COALESCE(NULLIF(vc.agg_fn,''),'MAX'))  AS agg_fn,
             COALESCE(vc.position, 1000)                  AS position
             FROM view_columns vc
-            LEFT JOIN fielddefinitions fd ON fd.elementnumber = vc.elementnumber
-            LEFT JOIN labels l            ON l.elementnumber  = vc.elementnumber
+            LEFT JOIN fd_dedup fd ON fd.elementnumber = vc.elementnumber
+            LEFT JOIN labels l    ON l.elementnumber  = vc.elementnumber
             WHERE vc.view_name = %s
             ORDER BY position, alias_src
             """,
@@ -398,11 +404,17 @@ def build_view_sql(conn: PGConn, view_name: str) -> tuple[str, list[str]]:
 
             cur.execute(
                 f"""
-                WITH labels AS (
-                SELECT DISTINCT
+                WITH fd_dedup AS (
+                SELECT DISTINCT ON (elementnumber) elementnumber, elementname
+                FROM fielddefinitions
+                ORDER BY elementnumber
+                ),
+                labels AS (
+                SELECT DISTINCT ON (COALESCE(e.elementnumber, e.xmlname))
                     COALESCE(e.elementnumber, e.xmlname) AS elementnumber,
                     NULLIF(e.elementname,'')             AS xsd_elementname
                 FROM XSD_Elements e
+                ORDER BY COALESCE(e.elementnumber, e.xmlname)
                 )
                 SELECT DISTINCT
                 v.elementnumber,
@@ -413,7 +425,7 @@ def build_view_sql(conn: PGConn, view_name: str) -> tuple[str, list[str]]:
                 FROM v_elements_resolved v
                 LEFT JOIN labels l
                 ON l.elementnumber = v.elementnumber
-                LEFT JOIN fielddefinitions fd
+                LEFT JOIN fd_dedup fd
                 ON fd.elementnumber = v.elementnumber
                 WHERE {filter_sql}
                 AND NOT EXISTS (
