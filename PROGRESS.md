@@ -15,15 +15,21 @@
 
 ## Views
 - `ems_views.py init` run
-- Views added:
-  - `headers` — cardinality one, section: header
-  - `vitals` — cardinality many, section: evitals (rebuilt after fix)
-  - `times` — cardinality one, section: times
-  - `procedures` — cardinality many, section: procedures
+- Views (all verified):
+  - `headers` — cardinality one, sections: record + response (per-PCR identifiers: PCR#, agency, incident#, unit, response mode)
+  - `times` — cardinality one, section: times (14 timestamp columns)
+  - `vitals` — cardinality many, section: vitals (40 clinical columns, 1492 rows)
+  - `procedures` — cardinality many, section: procedures (14 columns, 174 rows)
+  - `patient` — cardinality one, section: patient (demographics: name, DOB, age, gender, race, address)
 
 ## Known Issues / Fixes
 - Initial vitals view used `--section vitals` which only returned pain score
   - Fixed by using `--section evitals` to match actual table names
+- `headers` view was returning only a raw container element
+  - Rebuilt using `record` + `response` sections with explicit per-PCR fields
+- Duplicate columns (`last_name_2`, etc.) caused by `fielddefinitions` and `XSD_Elements` JOINs producing multiple rows per element
+  - Fixed with `DISTINCT ON` in both CTEs in `ems_views.py`
+- `vitals` section registration was `evitals`; corrected to `vitals` to match `classify_section()` output
 
 ## Next Steps
 - [ ] Load more XML files for broader dataset
