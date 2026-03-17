@@ -31,9 +31,16 @@
   - Fixed with `DISTINCT ON` in both CTEs in `ems_views.py`
 - `vitals` section registration was `evitals`; corrected to `vitals` to match `classify_section()` output
 
+## GNIS Locality Resolution
+- NEMSIS encodes cities as USGS GNIS Feature IDs
+- `gnis_places` table loaded from USGS national populated places file + NY/NJ full domestic names files (190k+ records)
+- `load_gnis.py` — downloads and upserts GNIS data; run with `--file` to skip download
+- `gnis_name(feature_id)` PostgreSQL function for inline lookups
+- `patient_full` view — extends `patient` with resolved `city`, `county`, and `state` (via `gnis_places` JOIN)
+- Source files: `gnis_populated_places.zip`, `gnis_ny.zip`, `gnis_nj.zip`
+
 ## Next Steps
 - [ ] Load more XML files for broader dataset
-- [ ] Fix/verify remaining views (times, procedures, headers)
 - [ ] Explore data with SQL queries
 - [ ] Decide on analytics goals (dashboard, QI reporting, etc.)
 
