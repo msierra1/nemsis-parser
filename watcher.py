@@ -25,6 +25,7 @@ from database_setup import get_db_connection
 from main_ingest import (
     ARCHIVE_DIR,
     INGESTION_LOGIC_VERSION_NUMBER,
+    get_file_md5,
     get_ingestion_logic_schema_id,
     process_xml_file,
 )
@@ -88,8 +89,6 @@ class XMLIngestHandler(FileSystemEventHandler):
 
         filename = os.path.basename(path)
         self._seen.add(path)
-        log.info("New file detected: %s — starting ingestion", filename)
-        notify("NEMSIS Watcher", f"Ingesting {filename}…")
 
         conn = None
         try:
@@ -98,6 +97,25 @@ class XMLIngestHandler(FileSystemEventHandler):
                 log.error("Could not connect to database. Skipping %s", filename)
                 notify("NEMSIS Watcher ❌", f"DB connection failed for {filename}")
                 return
+
+            # Duplicate check via MD5
+            md5 = get_file_md5(path)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT processingtimestamp FROM XMLFilesProcessed WHERE md5hash = %s AND status LIKE 'Staged%%' LIMIT 1",
+                    (md5,),
+                )
+                existing = cur.fetchone()
+            if existing:
+                log.warning("Skipping %s — duplicate of file ingested on %s", filename, existing[0].strftime("%Y-%m-%d %H:%M"))
+                notify("NEMSIS Watcher ⚠️", f"{filename} skipped (duplicate)")
+                # Move to archive so it doesn't sit in the drop folder
+                from main_ingest import archive_file
+                archive_file(path, ARCHIVE_DIR)
+                return
+
+            log.info("New file detected: %s — starting ingestion", filename)
+            notify("NEMSIS Watcher", f"Ingesting {filename}…")
 
             # Redirect stdout so ingest detail appears in watcher.log
             import io, sys
