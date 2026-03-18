@@ -11,9 +11,11 @@ Usage:
 """
 
 import argparse
-import os
-import time
 import logging
+import logging.handlers
+import os
+import subprocess
+import time
 
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
@@ -27,21 +29,41 @@ from main_ingest import (
     process_xml_file,
 )
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-log = logging.getLogger(__name__)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+LOG_FILE = os.path.join(BASE_DIR, "watcher.log")
+DEFAULT_WATCH_DIR = os.path.join(BASE_DIR, "nemsis_xml")
 
-DEFAULT_WATCH_DIR = os.path.join(os.path.dirname(__file__), "nemsis_xml")
+# --- Logging: console + rotating file (5 MB, keep 3 backups) ---
+log = logging.getLogger("nemsis_watcher")
+log.setLevel(logging.INFO)
+
+_fmt = logging.Formatter("%(asctime)s  %(levelname)-8s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+
+_console = logging.StreamHandler()
+_console.setFormatter(_fmt)
+log.addHandler(_console)
+
+_file = logging.handlers.RotatingFileHandler(LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3)
+_file.setFormatter(_fmt)
+log.addHandler(_file)
+
+
+def notify(title: str, message: str):
+    """Send a macOS notification via osascript (silent no-op on failure)."""
+    try:
+        subprocess.run(
+            ["osascript", "-e", f'display notification "{message}" with title "{title}"'],
+            check=False,
+            capture_output=True,
+        )
+    except Exception:
+        pass
 
 
 class XMLIngestHandler(FileSystemEventHandler):
     def __init__(self, ingestion_schema_id):
         super().__init__()
         self.ingestion_schema_id = ingestion_schema_id
-        # Track in-progress files so a partial write doesn't trigger twice
         self._seen: set[str] = set()
 
     def on_created(self, event):
@@ -50,7 +72,6 @@ class XMLIngestHandler(FileSystemEventHandler):
         self._handle(event.src_path)
 
     def on_moved(self, event):
-        # Fires when a file is moved/renamed into the watch directory
         if event.is_directory:
             return
         self._handle(event.dest_path)
@@ -61,27 +82,35 @@ class XMLIngestHandler(FileSystemEventHandler):
         if path in self._seen:
             return
 
-        # Wait briefly for the file write to complete before reading
         time.sleep(0.5)
         if not os.path.exists(path):
             return
 
+        filename = os.path.basename(path)
         self._seen.add(path)
-        log.info("New file detected: %s — starting ingestion", path)
+        log.info("New file detected: %s — starting ingestion", filename)
+        notify("NEMSIS Watcher", f"Ingesting {filename}…")
 
         conn = None
         try:
             conn = get_db_connection()
             if conn is None:
-                log.error("Could not connect to database. Skipping %s", path)
+                log.error("Could not connect to database. Skipping %s", filename)
+                notify("NEMSIS Watcher ❌", f"DB connection failed for {filename}")
                 return
+
             success = process_xml_file(conn, path, self.ingestion_schema_id)
+
             if success:
-                log.info("Ingestion succeeded: %s", path)
+                log.info("Ingestion succeeded: %s", filename)
+                notify("NEMSIS Watcher ✅", f"{filename} ingested successfully")
             else:
-                log.error("Ingestion failed: %s — check logs above", path)
+                log.error("Ingestion failed: %s — check watcher.log", filename)
+                notify("NEMSIS Watcher ❌", f"{filename} failed — check watcher.log")
+
         except Exception as e:
-            log.exception("Unexpected error ingesting %s: %s", path, e)
+            log.exception("Unexpected error ingesting %s: %s", filename, e)
+            notify("NEMSIS Watcher ❌", f"Error ingesting {filename}")
         finally:
             if conn:
                 conn.close()
@@ -104,10 +133,9 @@ def main():
         os.makedirs(watch_dir)
         log.info("Created watch directory: %s", watch_dir)
 
-    log.info(
-        "Connecting to %s@%s:%s to resolve ingestion schema version...",
-        PG_DATABASE, PG_HOST, PG_PORT,
-    )
+    log.info("Log file: %s", LOG_FILE)
+    log.info("Connecting to %s@%s:%s ...", PG_DATABASE, PG_HOST, PG_PORT)
+
     conn = get_db_connection()
     if conn is None:
         log.error("Cannot connect to database. Exiting.")
@@ -118,8 +146,7 @@ def main():
 
     if ingestion_schema_id is None:
         log.error(
-            "Ingestion version '%s' not found in SchemaVersions. "
-            "Run database_setup.py first.",
+            "Ingestion version '%s' not found in SchemaVersions. Run database_setup.py first.",
             INGESTION_LOGIC_VERSION_NUMBER,
         )
         return
