@@ -228,8 +228,9 @@ def delete_existing_pcr_data(conn, pcr_uuid):
         with conn.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT table_name FROM information_schema.tables 
-                WHERE table_schema = 'public' AND table_name NOT LIKE 'pg_%%' 
+                SELECT table_name FROM information_schema.tables
+                WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
+                AND table_name NOT LIKE 'pg_%%'
                 AND table_name NOT IN ('SchemaVersions', 'XMLFilesProcessed')
             """
             )
