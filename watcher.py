@@ -99,7 +99,20 @@ class XMLIngestHandler(FileSystemEventHandler):
                 notify("NEMSIS Watcher ❌", f"DB connection failed for {filename}")
                 return
 
-            success = process_xml_file(conn, path, self.ingestion_schema_id)
+            # Redirect stdout so ingest detail appears in watcher.log
+            import io, sys
+            captured = io.StringIO()
+            old_stdout = sys.stdout
+            sys.stdout = captured
+
+            try:
+                success = process_xml_file(conn, path, self.ingestion_schema_id)
+            finally:
+                sys.stdout = old_stdout
+                detail = captured.getvalue().strip()
+                if detail:
+                    for line in detail.splitlines():
+                        log.info("  [ingest] %s", line)
 
             if success:
                 log.info("Ingestion succeeded: %s", filename)
