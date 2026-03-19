@@ -1,173 +1,110 @@
-import psycopg2
-import psycopg2.extras
+import duckdb
 import datetime
-import uuid  # For generating initial schema version if needed, or other UUIDs
 
-from config import PG_HOST, PG_PORT, PG_DATABASE, PG_USER, PG_PASSWORD
-
-# Import PostgreSQL connection details from config.py
-# try:
-#     from config import PG_HOST, PG_PORT, PG_DATABASE, PG_USER, PG_PASSWORD
-# except ImportError:
-#     print("Error: Could not import PostgreSQL configuration from config.py.")
-#     print(
-#         "Ensure config.py is present and defines PG_HOST, PG_PORT, PG_DATABASE, PG_USER, PG_PASSWORD."
-#     )
-#     # Fallback or exit might be needed here if config is critical
-#     exit(1)
-CONNECTION = psycopg2.extensions.connection
+from config import DUCKDB_PATH
 
 
-def get_db_connection() -> CONNECTION:
-    """Establishes a connection to the PostgreSQL database."""
-    if not all([PG_DATABASE, PG_USER, PG_PASSWORD]):
-        raise ValueError(
-            "Database connection cannot be established: Missing PG_DATABASE, PG_USER, or PG_PASSWORD in config."
-        )
-
-    try:
-        conn = psycopg2.connect(
-            host=PG_HOST,
-            port=PG_PORT,
-            dbname=PG_DATABASE,
-            user=PG_USER,
-            password=PG_PASSWORD,
-        )
-        # conn.row_factory is not a direct attribute. Use cursor_factory for dict-like rows.
-        # psycopg2.extras.DictCursor will allow accessing columns by name.
-        print(
-            f"Successfully connected to PostgreSQL database: {PG_DATABASE} on {PG_HOST}:{PG_PORT}"
-        )
-        return conn
-    except psycopg2.OperationalError as e:
-        raise ConnectionError(f"Error connecting to PostgreSQL database: {e}")
+def get_db_connection() -> duckdb.DuckDBPyConnection:
+    """Opens a connection to the DuckDB database file."""
+    conn = duckdb.connect(DUCKDB_PATH)
+    print(f"Successfully connected to DuckDB: {DUCKDB_PATH}")
+    return conn
 
 
 def create_xsd_schema_tables(conn):
-    """Creates XSD schema metadata tables used by the NEMSIS XSD ingestion."""
-    with conn.cursor() as cursor:
-        cursor.execute(
-            """
-            -- Elements and their schema metadata
-            CREATE TABLE IF NOT EXISTS XSD_Elements (
-              id SERIAL PRIMARY KEY,
-              DatasetName TEXT NOT NULL,           -- e.g., 'eResponse'
-              ElementNumber TEXT,                  -- e.g., 'eResponse.13'
-              ElementName TEXT NOT NULL,           -- human-friendly label when available
-              XMLName TEXT NOT NULL,               -- exact XML element @name
-              TypeName TEXT,                       -- referenced or inline base type
-              GroupName TEXT,                      -- parent group
-              Definition TEXT,
-              Usage TEXT,
-              v2Number TEXT,
-              National BOOLEAN,
-              State BOOLEAN,
-              MinOccurs INTEGER,
-              MaxOccurs TEXT,                      -- 'unbounded' or integer as text
-              Nillable BOOLEAN DEFAULT FALSE,
-              HasSimpleContent BOOLEAN DEFAULT FALSE,
-              CreatedAt TIMESTAMP DEFAULT now()
-            );
-            """
-        )
+    """Creates XSD schema metadata tables."""
+    conn.execute("""
+        CREATE SEQUENCE IF NOT EXISTS xsd_elements_id_seq;
 
-        cursor.execute(
-            """
-            -- Simple types and their documentation (create before enums)
-            CREATE TABLE IF NOT EXISTS XSD_SimpleTypes (
-              TypeName TEXT PRIMARY KEY,
-              BaseType TEXT,                       -- xs:string, xs:decimal, etc.
-              Documentation TEXT
-            );
-            """
-        )
+        CREATE TABLE IF NOT EXISTS XSD_Elements (
+          id          INTEGER PRIMARY KEY DEFAULT nextval('xsd_elements_id_seq'),
+          DatasetName TEXT NOT NULL,
+          ElementNumber TEXT,
+          ElementName TEXT NOT NULL,
+          XMLName     TEXT NOT NULL,
+          TypeName    TEXT,
+          GroupName   TEXT,
+          Definition  TEXT,
+          Usage       TEXT,
+          v2Number    TEXT,
+          National    BOOLEAN,
+          State       BOOLEAN,
+          MinOccurs   INTEGER,
+          MaxOccurs   TEXT,
+          Nillable    BOOLEAN DEFAULT FALSE,
+          HasSimpleContent BOOLEAN DEFAULT FALSE,
+          CreatedAt   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    """)
 
-        cursor.execute(
-            """
-            -- Enumerations for simple types (code -> description)
-            CREATE TABLE IF NOT EXISTS XSD_Enumerations (
-              TypeName TEXT REFERENCES XSD_SimpleTypes(TypeName) ON DELETE CASCADE,
-              Code TEXT,
-              CodeDescription TEXT,
-              PRIMARY KEY (TypeName, Code)
-            );
-            """
-        )
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS XSD_SimpleTypes (
+          TypeName      TEXT PRIMARY KEY,
+          BaseType      TEXT,
+          Documentation TEXT
+        );
+    """)
 
-        cursor.execute(
-            """
-            -- Element attributes (e.g., NV, CorrelationID with allowed values)
-            CREATE TABLE IF NOT EXISTS XSD_ElementAttributes (
-              ElementId INTEGER REFERENCES XSD_Elements(id) ON DELETE CASCADE,
-              AttributeName TEXT,
-              AllowedValues TEXT,                  -- e.g., 'NV.NotApplicable|NV.NotRecorded|NV.NotReporting'
-              UNIQUE (ElementId, AttributeName)
-            );
-            """
-        )
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS XSD_Enumerations (
+          TypeName        TEXT REFERENCES XSD_SimpleTypes(TypeName),
+          Code            TEXT,
+          CodeDescription TEXT,
+          PRIMARY KEY (TypeName, Code)
+        );
+    """)
 
-        cursor.execute(
-            """
-            -- Optional: map element -> valueset type (handy join)
-            CREATE TABLE IF NOT EXISTS XSD_ElementValueSet (
-              ElementId INTEGER REFERENCES XSD_Elements(id) ON DELETE CASCADE,
-              TypeName TEXT REFERENCES XSD_SimpleTypes(TypeName) ON DELETE CASCADE,
-              PRIMARY KEY (ElementId, TypeName)
-            );
-            """
-        )
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS XSD_ElementAttributes (
+          ElementId     INTEGER REFERENCES XSD_Elements(id),
+          AttributeName TEXT,
+          AllowedValues TEXT,
+          UNIQUE (ElementId, AttributeName)
+        );
+    """)
 
-        cursor.execute(
-            "CREATE INDEX IF NOT EXISTS idx_xe_dataset_num ON XSD_Elements(DatasetName, ElementNumber);"
-        )
-        cursor.execute(
-            "CREATE INDEX IF NOT EXISTS idx_xe_xmlname ON XSD_Elements(XMLName);"
-        )
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS XSD_ElementValueSet (
+          ElementId INTEGER REFERENCES XSD_Elements(id),
+          TypeName  TEXT REFERENCES XSD_SimpleTypes(TypeName),
+          PRIMARY KEY (ElementId, TypeName)
+        );
+    """)
 
-    conn.commit()
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_xe_dataset_num ON XSD_Elements(DatasetName, ElementNumber);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_xe_xmlname ON XSD_Elements(XMLName);")
     print("Checked/Created XSD_* schema metadata tables and indexes.")
 
 
 def create_tables(conn):
-    """Creates the initial database tables if they don't exist (PostgreSQL syntax)."""
-    # Using psycopg2.extras.DictCursor for easier row access by name later, though not strictly needed for DDL
-    with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
-        # SchemaVersions Table for PostgreSQL
-        cursor.execute(
-            """
+    """Creates the core database tables if they don't exist."""
+    conn.execute("""
+        CREATE SEQUENCE IF NOT EXISTS schema_versions_id_seq;
+
         CREATE TABLE IF NOT EXISTS SchemaVersions (
-            SchemaVersionID SERIAL PRIMARY KEY, -- PostgreSQL auto-incrementing integer
-            VersionNumber TEXT NOT NULL UNIQUE,
-            CreationDate TIMESTAMPTZ NOT NULL, -- Use TIMESTAMPTZ for timezone awareness
-            UpdateDate TIMESTAMPTZ,
-            Description TEXT,
-            DemographicGroup TEXT NULL -- Remains for now
+            SchemaVersionID INTEGER PRIMARY KEY DEFAULT nextval('schema_versions_id_seq'),
+            VersionNumber   TEXT NOT NULL UNIQUE,
+            CreationDate    TIMESTAMPTZ NOT NULL,
+            UpdateDate      TIMESTAMPTZ,
+            Description     TEXT,
+            DemographicGroup TEXT
         );
-        """
-        )
-        print("Checked/Created SchemaVersions table.")
+    """)
+    print("Checked/Created SchemaVersions table.")
 
-        # XMLFilesProcessed Table for PostgreSQL
-        cursor.execute(
-            """
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS XMLFilesProcessed (
-            ProcessedFileID TEXT PRIMARY KEY,
+            ProcessedFileID  TEXT PRIMARY KEY,
             OriginalFileName TEXT NOT NULL,
-            MD5Hash TEXT,
+            MD5Hash          TEXT,
             ProcessingTimestamp TIMESTAMPTZ NOT NULL,
-            Status TEXT NOT NULL, 
-            SchemaVersionID INTEGER,
-            DemographicGroup TEXT NULL, -- This will now receive NULL from main_ingest.py v4 logic
-            FOREIGN KEY (SchemaVersionID) REFERENCES SchemaVersions(SchemaVersionID)
+            Status           TEXT NOT NULL,
+            SchemaVersionID  INTEGER REFERENCES SchemaVersions(SchemaVersionID),
+            DemographicGroup TEXT
         );
-        """
-        )
-        print("Checked/Created XMLFilesProcessed table.")
-
-    conn.commit()  # Commit DDL changes
-    print(
-        "Core database tables (SchemaVersions, XMLFilesProcessed) checked/created successfully for PostgreSQL."
-    )
+    """)
+    print("Checked/Created XMLFilesProcessed table.")
+    print("Core database tables checked/created successfully.")
 
 
 def add_initial_schema_version(
@@ -176,60 +113,34 @@ def add_initial_schema_version(
     description="Dynamic table logic v4 (PCR UUID based overwrite).",
     demographic_group=None,
 ):
-    """Adds an initial record to the SchemaVersions table if no versions exist."""
-    with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
-        cursor.execute(
-            "SELECT COUNT(*) AS count FROM SchemaVersions"
-        )  # Use AS for column name with DictCursor
-        if cursor.fetchone()["count"] == 0:
-            creation_date = datetime.datetime.now(
-                datetime.timezone.utc
-            )  # Use timezone-aware datetime
-            try:
-                cursor.execute(
-                    """
-                INSERT INTO SchemaVersions (VersionNumber, CreationDate, Description, DemographicGroup)
-                VALUES (%s, %s, %s, %s)
-                """,
-                    (version_number, creation_date, description, demographic_group),
-                )
-                conn.commit()  # Commit this insert
-                print(
-                    f"Initial schema version {version_number} added to SchemaVersions table."
-                )
-            except psycopg2.IntegrityError:
-                conn.rollback()  # Rollback if insert fails (e.g. unique constraint)
-                print(
-                    f"Schema version {version_number} or another initial version already exists or other integrity error."
-                )
-            except psycopg2.Error as e:
-                conn.rollback()
-                print(f"Database error adding initial schema version: {e}")
-        else:
-            print(
-                "SchemaVersions table already contains entries. Skipping initial version addition."
+    """Adds an initial record to SchemaVersions if none exists."""
+    result = conn.execute("SELECT COUNT(*) FROM SchemaVersions").fetchone()
+    if result[0] == 0:
+        creation_date = datetime.datetime.now(datetime.timezone.utc)
+        try:
+            conn.execute(
+                "INSERT INTO SchemaVersions (VersionNumber, CreationDate, Description, DemographicGroup) VALUES (?, ?, ?, ?)",
+                (version_number, creation_date, description, demographic_group),
             )
+            print(f"Initial schema version {version_number} added to SchemaVersions.")
+        except Exception as e:
+            print(f"Error adding initial schema version: {e}")
+    else:
+        print("SchemaVersions table already contains entries. Skipping.")
 
 
 if __name__ == "__main__":
-    print(f"Initializing PostgreSQL database defined in config for dynamic schema v4.")
-    db_conn = None  # Renamed from conn to avoid conflict with module-level conn if any
+    print("Initializing DuckDB database.")
+    db_conn = None
     try:
         db_conn = get_db_connection()
-        if db_conn:
-            create_tables(db_conn)
-            create_xsd_schema_tables(db_conn)
-            add_initial_schema_version(
-                db_conn, demographic_group="SystemInternal_PG_v4"
-            )
-        else:
-            print("Could not establish database connection. Setup aborted.")
-    except psycopg2.Error as e:
-        print(f"PostgreSQL database error during setup: {e}")
+        create_tables(db_conn)
+        create_xsd_schema_tables(db_conn)
+        add_initial_schema_version(db_conn, demographic_group="SystemInternal_DuckDB_v4")
     except Exception as e:
-        print(f"An unexpected error occurred during PostgreSQL setup: {e}")
+        print(f"Error during setup: {e}")
     finally:
         if db_conn:
             db_conn.close()
-            print("PostgreSQL database connection closed.")
-    print("PostgreSQL Database setup script for dynamic schema v4 finished.")
+            print("DuckDB connection closed.")
+    print("Database setup finished.")

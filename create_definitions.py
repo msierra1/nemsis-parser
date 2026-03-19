@@ -1,15 +1,14 @@
 import re
 import csv
 import requests
-import psycopg2
 from typing import Optional, Tuple, Dict, List
 from xml.etree import ElementTree as ET
 from database_setup import get_db_connection
 
 # =========================
-# CONFIG (NEMSIS v3.3.4)
+# CONFIG (NEMSIS v3.5.1)
 # =========================
-BASE_XSD_URL = "https://nemsis.org/media/nemsis_v3/release-3.3.4/XSDs/NEMSIS_XSDs"
+BASE_XSD_URL = "https://nemsis.org/media/nemsis_v3/release-3.5.1/XSDs/NEMSIS_XSDs"
 EMS_DATASET_XSD_URL = f"{BASE_XSD_URL}/EMSDataSet_v3.xsd"
 COMMON_TYPES_XSD_URL = f"{BASE_XSD_URL}/commonTypes_v3.xsd"
 
@@ -20,102 +19,79 @@ XS = {"xs": "http://www.w3.org/2001/XMLSchema"}
 # DB helpers
 # =========================
 def exec_sql(conn, sql, params=None, many=False):
-    cur = conn.cursor()
-    try:
-        if many:
-            cur.executemany(sql, params)
-        else:
-            cur.execute(sql, params or ())
-        conn.commit()
-    finally:
-        cur.close()
+    if many:
+        conn.executemany(sql, params)
+    else:
+        conn.execute(sql, params or [])
 
 
 def fetchone(conn, sql, params=None):
-    cur = conn.cursor()
-    try:
-        cur.execute(sql, params or ())
-        return cur.fetchone()
-    finally:
-        cur.close()
+    return conn.execute(sql, params or []).fetchone()
 
 
 def ensure_tables(conn):
-    exec_sql(
-        conn,
-        """
+    conn.execute("CREATE SEQUENCE IF NOT EXISTS xsd_elements_id_seq;")
+    exec_sql(conn, """
     CREATE TABLE IF NOT EXISTS XSD_Elements (
-      id SERIAL PRIMARY KEY,
-      DatasetName TEXT NOT NULL,           -- e.g., 'eDispatch', 'eResponse'
-      ElementNumber TEXT,                  -- e.g., 'eDispatch.03'
-      ElementName TEXT NOT NULL,           -- label (TacDoc Name if present)
-      XMLName TEXT NOT NULL,               -- exact XML element @name
-      TypeName TEXT,                       -- referenced or base type
-      GroupName TEXT,                      -- parent inline group (if any)
-      Definition TEXT,
-      Usage TEXT,
-      v2Number TEXT,
-      National BOOLEAN,
-      State BOOLEAN,
-      MinOccurs INTEGER,
-      MaxOccurs TEXT,                      -- 'unbounded' or integer-as-text
-      Nillable BOOLEAN DEFAULT FALSE,
+      id            INTEGER PRIMARY KEY DEFAULT nextval('xsd_elements_id_seq'),
+      DatasetName   TEXT NOT NULL,
+      ElementNumber TEXT,
+      ElementName   TEXT NOT NULL,
+      XMLName       TEXT NOT NULL,
+      TypeName      TEXT,
+      GroupName     TEXT,
+      Definition    TEXT,
+      Usage         TEXT,
+      v2Number      TEXT,
+      National      BOOLEAN,
+      State         BOOLEAN,
+      MinOccurs     INTEGER,
+      MaxOccurs     TEXT,
+      Nillable      BOOLEAN DEFAULT FALSE,
       HasSimpleContent BOOLEAN DEFAULT FALSE,
-      CreatedAt TIMESTAMP DEFAULT now()
+      CreatedAt     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
-    """,
-    )
-    exec_sql(
-        conn,
-        """
+    """)
+    exec_sql(conn, """
     CREATE TABLE IF NOT EXISTS XSD_ElementAttributes (
-      ElementId INTEGER REFERENCES XSD_Elements(id) ON DELETE CASCADE,
+      ElementId     INTEGER REFERENCES XSD_Elements(id),
       AttributeName TEXT,
       AllowedValues TEXT,
       UNIQUE (ElementId, AttributeName)
     );
-    """,
-    )
-    exec_sql(
-        conn,
-        """
+    """)
+    exec_sql(conn, """
     CREATE TABLE IF NOT EXISTS XSD_SimpleTypes (
-      TypeName TEXT PRIMARY KEY,
-      BaseType TEXT,
+      TypeName      TEXT PRIMARY KEY,
+      BaseType      TEXT,
       Documentation TEXT
     );
-    """,
-    )
-    exec_sql(
-        conn,
-        """
+    """)
+    exec_sql(conn, """
     CREATE TABLE IF NOT EXISTS XSD_Enumerations (
-      TypeName TEXT REFERENCES XSD_SimpleTypes(TypeName) ON DELETE CASCADE,
-      Code TEXT,
+      TypeName        TEXT REFERENCES XSD_SimpleTypes(TypeName),
+      Code            TEXT,
       CodeDescription TEXT,
       PRIMARY KEY (TypeName, Code)
     );
-    """,
-    )
-    exec_sql(
-        conn,
-        """
+    """)
+    exec_sql(conn, """
     CREATE TABLE IF NOT EXISTS XSD_ElementValueSet (
-      ElementId INTEGER REFERENCES XSD_Elements(id) ON DELETE CASCADE,
-      TypeName TEXT REFERENCES XSD_SimpleTypes(TypeName) ON DELETE CASCADE,
+      ElementId INTEGER REFERENCES XSD_Elements(id),
+      TypeName  TEXT REFERENCES XSD_SimpleTypes(TypeName),
       PRIMARY KEY (ElementId, TypeName)
     );
-    """,
-    )
+    """)
 
 
 def clear_all_datasets(conn):
-    exec_sql(
-        conn,
-        "TRUNCATE XSD_ElementAttributes, XSD_ElementValueSet, XSD_Elements RESTART IDENTITY;",
-    )
-    # Do NOT truncate types/enums; they are shared. If you want a clean slate:
-    # exec_sql(conn, "TRUNCATE XSD_Enumerations, XSD_SimpleTypes;")
+    conn.execute("DELETE FROM XSD_ElementAttributes;")
+    conn.execute("DELETE FROM XSD_ElementValueSet;")
+    conn.execute("DELETE FROM XSD_Elements;")
+    # DuckDB sequences reset automatically when the table is empty
+    # Types/enums are shared — truncate them too for a full reload:
+    # conn.execute("DELETE FROM XSD_Enumerations;")
+    # conn.execute("DELETE FROM XSD_SimpleTypes;")
 
 
 # =========================
@@ -229,7 +205,7 @@ def upsert_simple_types(conn, trees: List[ET.Element]):
             doc = text_or_none(st.find("xs:annotation/xs:documentation", XS))
             exec_sql(
                 conn,
-                "INSERT INTO XSD_SimpleTypes (TypeName, BaseType, Documentation) VALUES (%s,%s,%s) "
+                "INSERT INTO XSD_SimpleTypes (TypeName, BaseType, Documentation) VALUES (?,?,?) "
                 "ON CONFLICT (TypeName) DO UPDATE SET BaseType=EXCLUDED.BaseType, Documentation=EXCLUDED.Documentation",
                 (tname, base, doc),
             )
@@ -242,7 +218,7 @@ def upsert_simple_types(conn, trees: List[ET.Element]):
                     if code:
                         exec_sql(
                             conn,
-                            "INSERT INTO XSD_Enumerations (TypeName, Code, CodeDescription) VALUES (%s,%s,%s) "
+                            "INSERT INTO XSD_Enumerations (TypeName, Code, CodeDescription) VALUES (?,?,?) "
                             "ON CONFLICT (TypeName, Code) DO UPDATE SET CodeDescription=EXCLUDED.CodeDescription",
                             (tname, code, label),
                         )
@@ -256,13 +232,16 @@ def insert_element(conn, payload: Dict) -> int:
           (DatasetName, ElementNumber, ElementName, XMLName, TypeName, GroupName,
            Definition, Usage, v2Number, National, State,
            MinOccurs, MaxOccurs, Nillable, HasSimpleContent)
-        VALUES
-          (%(DatasetName)s, %(ElementNumber)s, %(ElementName)s, %(XMLName)s, %(TypeName)s, %(GroupName)s,
-           %(Definition)s, %(Usage)s, %(v2Number)s, %(National)s, %(State)s,
-           %(MinOccurs)s, %(MaxOccurs)s, %(Nillable)s, %(HasSimpleContent)s)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         RETURNING id;
-    """,
-        payload,
+        """,
+        (
+            payload["DatasetName"], payload["ElementNumber"], payload["ElementName"],
+            payload["XMLName"], payload["TypeName"], payload["GroupName"],
+            payload["Definition"], payload["Usage"], payload["v2Number"],
+            payload["National"], payload["State"], payload["MinOccurs"],
+            payload["MaxOccurs"], payload["Nillable"], payload["HasSimpleContent"],
+        ),
     )
     return int(row[0])
 
@@ -272,7 +251,7 @@ def insert_attribute(conn, element_id: int, name: str, allowed: Optional[str]):
         conn,
         """
         INSERT INTO XSD_ElementAttributes (ElementId, AttributeName, AllowedValues)
-        VALUES (%s,%s,%s)
+        VALUES (?,?,?)
         ON CONFLICT (ElementId, AttributeName) DO UPDATE SET AllowedValues=EXCLUDED.AllowedValues
     """,
         (element_id, name, allowed),
@@ -286,7 +265,7 @@ def map_element_valueset(conn, element_id: int, type_name: Optional[str]):
         conn,
         """
         INSERT INTO XSD_ElementValueSet (ElementId, TypeName)
-        VALUES (%s,%s)
+        VALUES (?,?)
         ON CONFLICT (ElementId, TypeName) DO NOTHING
     """,
         (element_id, type_name),
@@ -427,7 +406,7 @@ def ingest_all_schemas(conn):
             continue
         walk_elements_for_dataset(conn, ds, seq)
 
-    print("[XSD] Ingestion complete for all modules (3.3.4).")
+    print("[XSD] Ingestion complete for all modules (3.5.1).")
 
 
 # =========================
@@ -438,35 +417,27 @@ FIELD_DEF_URL = "https://nemsis.org/media/nemsis_v3/release-3.5.1/DataDictionary
 
 
 def create_legacy_tables(conn):
-    cur = conn.cursor()
-    cur.execute(
-        """
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS ElementDefinitions (
-            DatasetName TEXT,
+            DatasetName   TEXT,
             ElementNumber TEXT,
-            ElementName TEXT,
-            Code TEXT,
+            ElementName   TEXT,
+            Code          TEXT,
             CodeDescription TEXT
         );
-    """
-    )
-    cur.execute(
-        """
+    """)
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS FieldDefinitions (
-            Dataset TEXT,
-            DatasetType TEXT,
+            Dataset       TEXT,
+            DatasetType   TEXT,
             ElementNumber TEXT,
-            ElementName TEXT,
-            Attribute TEXT
+            ElementName   TEXT,
+            Attribute     TEXT
         );
-    """
-    )
-    conn.commit()
-    cur.close()
+    """)
 
 
 def populate_legacy_tables(conn):
-    # Keep if needed by other parts of your app
     for url, tbl in [
         (NEMSIS_ENUM_URL, "ElementDefinitions"),
         (FIELD_DEF_URL, "FieldDefinitions"),
@@ -478,38 +449,17 @@ def populate_legacy_tables(conn):
             {k.strip().strip("'"): (v or "").strip().strip("'") for k, v in row.items()}
             for row in reader
         ]
-        cur = conn.cursor()
-        cur.execute(f"DELETE FROM {tbl};")
+        conn.execute(f"DELETE FROM {tbl};")
         if tbl == "ElementDefinitions":
-            cur.executemany(
-                "INSERT INTO ElementDefinitions (DatasetName, ElementNumber, ElementName, Code, CodeDescription) VALUES (%s,%s,%s,%s,%s)",
-                [
-                    (
-                        x.get("DatasetName", ""),
-                        x.get("ElementNumber", ""),
-                        x.get("ElementName", ""),
-                        x.get("Code", ""),
-                        x.get("CodeDescription", ""),
-                    )
-                    for x in rows
-                ],
+            conn.executemany(
+                "INSERT INTO ElementDefinitions (DatasetName, ElementNumber, ElementName, Code, CodeDescription) VALUES (?,?,?,?,?)",
+                [(x.get("DatasetName",""), x.get("ElementNumber",""), x.get("ElementName",""), x.get("Code",""), x.get("CodeDescription","")) for x in rows],
             )
         else:
-            cur.executemany(
-                "INSERT INTO FieldDefinitions (Dataset, DatasetType, ElementNumber, ElementName, Attribute) VALUES (%s,%s,%s,%s,%s)",
-                [
-                    (
-                        x.get("Dataset", ""),
-                        x.get("DatasetType", ""),
-                        x.get("ElementNumber", ""),
-                        x.get("ElementName", ""),
-                        x.get("Attribute", ""),
-                    )
-                    for x in rows
-                ],
+            conn.executemany(
+                "INSERT INTO FieldDefinitions (Dataset, DatasetType, ElementNumber, ElementName, Attribute) VALUES (?,?,?,?,?)",
+                [(x.get("Dataset",""), x.get("DatasetType",""), x.get("ElementNumber",""), x.get("ElementName",""), x.get("Attribute","")) for x in rows],
             )
-        conn.commit()
-        cur.close()
         print(f"[Legacy] Inserted {len(rows)} into {tbl}")
 
 

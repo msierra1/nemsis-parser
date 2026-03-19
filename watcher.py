@@ -20,7 +20,7 @@ import time
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
-from config import PG_HOST, PG_PORT, PG_DATABASE
+from config import DUCKDB_PATH
 from database_setup import get_db_connection
 from main_ingest import (
     ARCHIVE_DIR,
@@ -100,12 +100,10 @@ class XMLIngestHandler(FileSystemEventHandler):
 
             # Duplicate check via MD5
             md5 = get_file_md5(path)
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT processingtimestamp FROM XMLFilesProcessed WHERE md5hash = %s AND status LIKE 'Staged%%' LIMIT 1",
-                    (md5,),
-                )
-                existing = cur.fetchone()
+            existing = conn.execute(
+                "SELECT processingtimestamp FROM XMLFilesProcessed WHERE md5hash = ? AND status LIKE 'Staged%' LIMIT 1",
+                (md5,),
+            ).fetchone()
             if existing:
                 log.warning("Skipping %s — duplicate of file ingested on %s", filename, existing[0].strftime("%Y-%m-%d %H:%M"))
                 notify("NEMSIS Watcher ⚠️", f"{filename} skipped (duplicate)")
@@ -165,7 +163,7 @@ def main():
         log.info("Created watch directory: %s", watch_dir)
 
     log.info("Log file: %s", LOG_FILE)
-    log.info("Connecting to %s@%s:%s ...", PG_DATABASE, PG_HOST, PG_PORT)
+    log.info("Connecting to %s ...", DUCKDB_PATH)
 
     conn = get_db_connection()
     if conn is None:

@@ -15,8 +15,6 @@ import io
 import os
 import zipfile
 
-import psycopg2
-import psycopg2.extras
 import requests
 
 from database_setup import get_db_connection
@@ -35,13 +33,8 @@ CREATE TABLE IF NOT EXISTS gnis_places (
 """
 
 UPSERT = """
-INSERT INTO gnis_places (feature_id, feature_name, state_name, state_numeric, county_name)
-VALUES %s
-ON CONFLICT (feature_id) DO UPDATE
-    SET feature_name  = EXCLUDED.feature_name,
-        state_name    = EXCLUDED.state_name,
-        state_numeric = EXCLUDED.state_numeric,
-        county_name   = EXCLUDED.county_name;
+INSERT OR REPLACE INTO gnis_places (feature_id, feature_name, state_name, state_numeric, county_name)
+VALUES (?, ?, ?, ?, ?)
 """
 
 
@@ -81,11 +74,9 @@ def load(conn, zip_path: str):
 
     rows = list(seen.values())
 
-    print(f"Parsed {len(rows):,} records. Loading into PostgreSQL ...")
-    with conn.cursor() as cur:
-        cur.execute(CREATE_TABLE)
-        psycopg2.extras.execute_values(cur, UPSERT, rows, page_size=1000)
-    conn.commit()
+    print(f"Parsed {len(rows):,} records. Loading into DuckDB ...")
+    conn.execute(CREATE_TABLE)
+    conn.executemany(UPSERT, rows)
     print(f"Done — {len(rows):,} rows upserted into gnis_places.")
 
 
