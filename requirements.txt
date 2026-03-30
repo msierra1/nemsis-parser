@@ -1,0 +1,6 @@
+duckdb
+watchdog
+pandas
+requests
+openpyxl
+reportlab
