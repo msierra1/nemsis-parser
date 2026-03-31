@@ -24,6 +24,7 @@ from config import DUCKDB_PATH
 from database_setup import get_db_connection
 from main_ingest import (
     ARCHIVE_DIR,
+    FAILED_DIR,
     INGESTION_LOGIC_VERSION_NUMBER,
     get_file_md5,
     get_ingestion_logic_schema_id,
@@ -32,6 +33,9 @@ from main_ingest import (
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(BASE_DIR, "watcher.log")
+
+# Path to the ems-quality-measures project for incremental refresh
+QUALITY_PROJECT = os.path.join(os.path.dirname(BASE_DIR), "ems-quality-measures")
 DEFAULT_WATCH_DIR = os.path.join(BASE_DIR, "nemsis_xml")
 
 # --- Logging: console + rotating file (5 MB, keep 3 backups) ---
@@ -47,6 +51,38 @@ log.addHandler(_console)
 _file = logging.handlers.RotatingFileHandler(LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3)
 _file.setFormatter(_fmt)
 log.addHandler(_file)
+
+
+def refresh_quality_db():
+    """Trigger incremental refresh of the ems-quality-measures DB.
+
+    Runs as a subprocess so it doesn't block the watcher or interfere
+    with the nemsis-parser's DuckDB connection.
+    """
+    refresh_script = os.path.join(QUALITY_PROJECT, "src", "load_nemsis.py")
+    if not os.path.exists(refresh_script):
+        log.warning("Quality measures project not found at %s — skipping refresh.", QUALITY_PROJECT)
+        return
+
+    try:
+        log.info("Triggering incremental refresh of quality DB…")
+        result = subprocess.run(
+            ["python3", "-c",
+             "import sys; sys.path.insert(0, 'src'); "
+             "from load_nemsis import incremental_refresh; "
+             "r = incremental_refresh(); "
+             f"print(f'Quality DB refresh: {{r}}')"],
+            cwd=QUALITY_PROJECT,
+            capture_output=True, text=True, timeout=120,
+        )
+        if result.returncode == 0:
+            log.info("Quality DB refresh: %s", result.stdout.strip())
+        else:
+            log.error("Quality DB refresh failed: %s", result.stderr.strip())
+    except subprocess.TimeoutExpired:
+        log.error("Quality DB refresh timed out (120s).")
+    except Exception as e:
+        log.error("Quality DB refresh error: %s", e)
 
 
 def notify(title: str, message: str):
@@ -98,16 +134,16 @@ class XMLIngestHandler(FileSystemEventHandler):
                 notify("NEMSIS Watcher ❌", f"DB connection failed for {filename}")
                 return
 
-            # Duplicate check via MD5
+            # Duplicate check via MD5 — only skip if a SUCCESSFUL import exists
+            # Files with Error_* status are NOT considered duplicates
             md5 = get_file_md5(path)
             existing = conn.execute(
                 "SELECT processingtimestamp FROM XMLFilesProcessed WHERE md5hash = ? AND status LIKE 'Staged%' LIMIT 1",
                 (md5,),
             ).fetchone()
             if existing:
-                log.warning("Skipping %s — duplicate of file ingested on %s", filename, existing[0].strftime("%Y-%m-%d %H:%M"))
-                notify("NEMSIS Watcher ⚠️", f"{filename} skipped (duplicate)")
-                # Move to archive so it doesn't sit in the drop folder
+                log.warning("Skipping %s — duplicate of file successfully ingested on %s", filename, existing[0].strftime("%Y-%m-%d %H:%M"))
+                notify("NEMSIS Watcher ⚠️", f"{filename} skipped (duplicate of successful import)")
                 from main_ingest import archive_file
                 archive_file(path, ARCHIVE_DIR)
                 return
@@ -115,35 +151,26 @@ class XMLIngestHandler(FileSystemEventHandler):
             log.info("New file detected: %s — starting ingestion", filename)
             notify("NEMSIS Watcher", f"Ingesting {filename}…")
 
-            # Redirect stdout so ingest detail appears in watcher.log
-            import io, sys
-            captured = io.StringIO()
-            old_stdout = sys.stdout
-            sys.stdout = captured
-
-            try:
-                success = process_xml_file(conn, path, self.ingestion_schema_id)
-            finally:
-                sys.stdout = old_stdout
-                detail = captured.getvalue().strip()
-                if detail:
-                    for line in detail.splitlines():
-                        log.info("  [ingest] %s", line)
+            success, reason = process_xml_file(conn, path, self.ingestion_schema_id)
 
             if success:
                 log.info("Ingestion succeeded: %s", filename)
                 notify("NEMSIS Watcher ✅", f"{filename} ingested successfully")
+                refresh_quality_db()
             else:
-                log.error("Ingestion failed: %s — check watcher.log", filename)
-                notify("NEMSIS Watcher ❌", f"{filename} failed — check watcher.log")
+                log.error("Ingestion failed: %s — %s", filename, reason)
+                notify("NEMSIS Watcher ❌", f"{filename} FAILED: {reason}. Moved to {FAILED_DIR}/ — reimport after fixing.")
+                # Remove from _seen so the file can be retried if re-dropped
+                self._seen.discard(path)
 
         except Exception as e:
             log.exception("Unexpected error ingesting %s: %s", filename, e)
-            notify("NEMSIS Watcher ❌", f"Error ingesting {filename}")
+            notify("NEMSIS Watcher ❌", f"Error ingesting {filename}: {e}")
+            # Allow retry on unexpected errors too
+            self._seen.discard(path)
         finally:
             if conn:
                 conn.close()
-            self._seen.discard(path)
 
 
 def main():

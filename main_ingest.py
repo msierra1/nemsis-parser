@@ -4,6 +4,8 @@ import datetime
 import os
 import hashlib
 import argparse
+import logging
+import logging.handlers
 import shutil
 
 try:
@@ -15,7 +17,25 @@ except ImportError as e:
     exit(1)
 
 ARCHIVE_DIR = "processed_xml_archive"
+FAILED_DIR = "failed_xml"
 INGESTION_LOGIC_VERSION_NUMBER = "1.0.0-dynamic-ingestor-v4"
+
+# --- Logging ---
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+LOG_FILE = os.path.join(BASE_DIR, "ingest.log")
+
+log = logging.getLogger("nemsis_ingest")
+if not log.handlers:
+    log.setLevel(logging.INFO)
+    _fmt = logging.Formatter("%(asctime)s  %(levelname)-8s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+
+    _console = logging.StreamHandler()
+    _console.setFormatter(_fmt)
+    log.addHandler(_console)
+
+    _file = logging.handlers.RotatingFileHandler(LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3)
+    _file.setFormatter(_fmt)
+    log.addHandler(_file)
 
 
 def generate_unique_file_id():
@@ -32,7 +52,7 @@ def get_file_md5(file_path):
     except FileNotFoundError:
         return None
     except Exception as e:
-        print(f"Error calculating MD5 for {file_path}: {e}")
+        log.error("Error calculating MD5 for %s: %s", file_path, e)
         return None
 
 
@@ -44,7 +64,7 @@ def get_ingestion_logic_schema_id(conn, version_number):
         ).fetchone()
         return result[0] if result else None
     except Exception as e:
-        print(f"DB Error getting schema id: {e}")
+        log.error("DB Error getting schema id: %s", e)
         return None
 
 
@@ -55,10 +75,10 @@ def log_processed_file(conn, processed_file_id, original_file_name, md5_hash, st
             "INSERT INTO XMLFilesProcessed (ProcessedFileID, OriginalFileName, MD5Hash, ProcessingTimestamp, Status, SchemaVersionID, DemographicGroup) VALUES (?, ?, ?, ?, ?, ?, ?)",
             (processed_file_id, original_file_name, md5_hash, timestamp, status, schema_version_id, None),
         )
-        print(f"Logged file {original_file_name} (ID: {processed_file_id}) with status {status}.")
+        log.info("Logged file %s (ID: %s) with status %s", original_file_name, processed_file_id, status)
         return True
     except Exception as e:
-        print(f"DB error logging processed file {original_file_name}: {e}")
+        log.error("DB error logging processed file %s: %s", original_file_name, e)
         return False
 
 
@@ -71,12 +91,12 @@ def archive_file(file_path, archive_directory):
         base_filename = os.path.basename(file_path)
         archive_path = os.path.join(archive_directory, base_filename)
         if os.path.exists(archive_path):
-            print(f"Warning: File {base_filename} already in archive. Overwriting.")
+            log.warning("File %s already in archive. Overwriting.", base_filename)
         shutil.move(file_path, archive_path)
-        print(f"File {file_path} archived to {archive_path}")
+        log.info("File %s archived to %s", file_path, archive_path)
         return True
     except Exception as e:
-        print(f"Error archiving file {file_path}: {e}")
+        log.error("Error archiving file %s: %s", file_path, e)
         return False
 
 
@@ -98,7 +118,7 @@ def get_table_columns(conn, table_name):
         _table_column_cache[safe_table_name] = cols
     except Exception as e:
         if "does not exist" not in str(e).lower():
-            print(f"Error getting columns for {safe_table_name}: {e}")
+            log.error("Error getting columns for %s: %s", safe_table_name, e)
         _table_column_cache[safe_table_name] = set()
     return cols
 
@@ -106,7 +126,7 @@ def get_table_columns(conn, table_name):
 def ensure_table_and_columns(conn, table_name_suggestion, element_attributes, common_db_columns):
     table_name_raw = sanitize_xml_name(table_name_suggestion)
     if not table_name_raw:
-        print("Error: Table name suggestion is empty after sanitization.")
+        log.error("Table name suggestion is empty after sanitization.")
         return None, set()
 
     table_name = f'"{table_name_raw.lower()}"'
@@ -135,9 +155,9 @@ def ensure_table_and_columns(conn, table_name_suggestion, element_attributes, co
             conn.execute(create_sql)
             created_cols = {col_def.split()[0].strip('"').lower() for col_def in final_cols_for_create}
             _table_column_cache[table_name_raw] = created_cols
-            print(f"Table {table_name} created.")
+            log.info("Table %s created.", table_name)
         except Exception as e:
-            print(f"Error creating table {table_name}: {e}")
+            log.error("Error creating table %s: %s", table_name, e)
             return None, set()
 
     current_table_cols = get_table_columns(conn, table_name_raw)
@@ -153,10 +173,10 @@ def ensure_table_and_columns(conn, table_name_suggestion, element_attributes, co
         col_name_quoted = f'"{col_name}"'
         try:
             conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {col_name_quoted} TEXT;")
-            print(f"Added column {col_name_quoted} to {table_name}")
+            log.info("Added column %s to %s", col_name_quoted, table_name)
             _table_column_cache[table_name_raw].add(col_name)
         except Exception as e:
-            print(f"Error adding {col_name_quoted} to {table_name}: {e}")
+            log.error("Error adding %s to %s: %s", col_name_quoted, table_name, e)
 
     return table_name_raw, get_table_columns(conn, table_name_raw)
 
@@ -164,8 +184,7 @@ def ensure_table_and_columns(conn, table_name_suggestion, element_attributes, co
 def delete_existing_pcr_data(conn, pcr_uuid):
     if not pcr_uuid:
         return
-    print(f"Checking if PatientCareReport UUID: {pcr_uuid} exists in any dynamic tables. If found, it will be deleted before new data is inserted.")
-    deleted_total = 0
+    log.debug("Checking PCR UUID %s for pre-deletion.", pcr_uuid)
     try:
         tables_to_check = conn.execute("""
             SELECT table_name FROM information_schema.tables
@@ -186,33 +205,62 @@ def delete_existing_pcr_data(conn, pcr_uuid):
                     count = conn.execute(f'SELECT changes()').fetchone()
                     # DuckDB doesn't have changes() - use a count before/after approach
                 except Exception as e:
-                    print(f"Error deleting from {table_name_quoted}: {e}")
+                    log.error("Error deleting from %s: %s", table_name_quoted, e)
 
-        print(f"Deletion complete for PCR {pcr_uuid}")
+        log.debug("Deletion complete for PCR %s", pcr_uuid)
     except Exception as e:
-        print(f"DB error during PCR deletion: {e}")
+        log.error("DB error during PCR deletion: %s", e)
+
+
+def move_to_failed(file_path):
+    """Move a file to the failed_xml/ directory so it can be reimported."""
+    failed_dir = os.path.join(BASE_DIR, FAILED_DIR)
+    if not os.path.exists(file_path):
+        return None
+    try:
+        if not os.path.exists(failed_dir):
+            os.makedirs(failed_dir)
+        dest = os.path.join(failed_dir, os.path.basename(file_path))
+        if os.path.exists(dest):
+            # Append timestamp to avoid overwriting previous failures
+            name, ext = os.path.splitext(os.path.basename(file_path))
+            dest = os.path.join(failed_dir, f"{name}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}{ext}")
+        shutil.move(file_path, dest)
+        log.info("Failed file moved to %s", dest)
+        return dest
+    except Exception as e:
+        log.error("Could not move failed file %s: %s", file_path, e)
+        return None
 
 
 def process_xml_file(db_conn, xml_file_path, ingestion_schema_id):
-    print(f"\nProcessing XML: {xml_file_path}")
+    """Ingest a NEMSIS XML file. Returns (success: bool, failure_reason: str|None)."""
+    log.info("Processing XML: %s", xml_file_path)
     processed_file_id = generate_unique_file_id()
     original_file_name = os.path.basename(xml_file_path)
     md5_hash = get_file_md5(xml_file_path)
 
     if md5_hash is None and os.path.exists(xml_file_path):
+        reason = "Could not compute MD5 hash"
+        log.error("%s — %s", original_file_name, reason)
         log_processed_file(db_conn, processed_file_id, original_file_name, None, "Error_MD5", ingestion_schema_id)
-        return False
+        move_to_failed(xml_file_path)
+        return False, reason
+
     if not os.path.exists(xml_file_path):
-        print(f"Error: XML file not found at {xml_file_path}. Aborting.")
+        reason = "File not found"
+        log.error("%s — %s at %s", original_file_name, reason, xml_file_path)
         log_processed_file(db_conn, processed_file_id, original_file_name, md5_hash if md5_hash else "N/A", "Error_FileNotFound", ingestion_schema_id)
-        return False
+        return False, reason
 
     elements_data = parse_xml_file(xml_file_path)
 
     if not elements_data:
-        print(f"No elements parsed from {xml_file_path} or parsing error occurred.")
+        reason = "XML parsing returned no elements (empty or malformed file)"
+        log.error("%s — %s", original_file_name, reason)
         log_processed_file(db_conn, processed_file_id, original_file_name, md5_hash, "Error_Parsing_Empty", ingestion_schema_id)
-        return False
+        move_to_failed(xml_file_path)
+        return False, reason
 
     unique_pcr_uuids_in_file = {el["pcr_uuid_context"] for el in elements_data if el.get("pcr_uuid_context")}
 
@@ -222,11 +270,11 @@ def process_xml_file(db_conn, xml_file_path, ingestion_schema_id):
         db_conn.execute("BEGIN")
 
         if unique_pcr_uuids_in_file:
-            print(f"Found {len(unique_pcr_uuids_in_file)} unique PatientCareReport UUID(s) in this file for potential data overwrite.")
+            log.info("Found %d unique PCR UUID(s) — clearing existing data before insert.", len(unique_pcr_uuids_in_file))
             for pcr_uuid in unique_pcr_uuids_in_file:
                 delete_existing_pcr_data(db_conn, pcr_uuid)
         else:
-            print("No PatientCareReport UUIDs found in this file; no pre-deletion of data will occur.")
+            log.info("No PCR UUIDs found in file; skipping pre-deletion.")
 
         for element in elements_data:
             table_name_raw, actual_table_columns = ensure_table_and_columns(
@@ -234,8 +282,7 @@ def process_xml_file(db_conn, xml_file_path, ingestion_schema_id):
             )
 
             if not table_name_raw or not actual_table_columns:
-                print(f"Skipping element due to table creation/alteration error for suggested table {table_name_raw}")
-                raise Exception(f"Failed to ensure table/columns for {table_name_raw}")
+                raise Exception(f"Failed to ensure table/columns for {element['table_suggestion']}")
 
             insert_data = {
                 "element_id": element["element_id"],
@@ -258,22 +305,24 @@ def process_xml_file(db_conn, xml_file_path, ingestion_schema_id):
             try:
                 db_conn.execute(sql, values)
             except Exception as e:
-                print(f"DB Insert Error: {e} SQL: {sql}")
+                log.error("DB Insert Error: %s  SQL: %s", e, sql)
                 raise
 
         db_conn.execute("COMMIT")
-        print(f"All elements from {xml_file_path} successfully ingested and committed.")
+        log.info("Ingestion succeeded: %s (%d PCRs)", original_file_name, len(unique_pcr_uuids_in_file))
         log_processed_file(db_conn, processed_file_id, original_file_name, md5_hash, "Staged_Dynamic_DuckDB_V4", ingestion_schema_id)
 
         if not archive_file(xml_file_path, ARCHIVE_DIR):
-            print(f"Warning: Data staged for {xml_file_path}, but failed to archive.")
-        return True
+            log.warning("Data staged for %s, but failed to archive the file.", original_file_name)
+        return True, None
 
     except Exception as e:
         db_conn.execute("ROLLBACK")
-        print(f"DB Tx error for {xml_file_path}: {e}. Rolled back.")
+        reason = f"Database transaction error: {e}"
+        log.error("%s — %s. Rolled back.", original_file_name, reason)
         log_processed_file(db_conn, processed_file_id, original_file_name, md5_hash, "Error_Staging_Tx_DuckDB_V4", ingestion_schema_id)
-        return False
+        move_to_failed(xml_file_path)
+        return False, reason
     finally:
         _table_column_cache.clear()
 
@@ -287,13 +336,14 @@ def main():
     args = parser.parse_args()
     ARCHIVE_DIR = args.archive_dir
 
-    print(f"--- NEMSIS Dynamic Data Ingestion V4 (DuckDB) ---")
-    print(f"DB Target: {DUCKDB_PATH}, Archive: {ARCHIVE_DIR}, IngestionVersion: {INGESTION_LOGIC_VERSION_NUMBER}")
+    log.info("--- NEMSIS Dynamic Data Ingestion V4 (DuckDB) ---")
+    log.info("DB: %s  Archive: %s  Version: %s", DUCKDB_PATH, ARCHIVE_DIR, INGESTION_LOGIC_VERSION_NUMBER)
 
     conn = None
     try:
         conn = get_db_connection()
         if conn is None:
+            log.error("Could not connect to database.")
             return
 
         if not os.path.exists(ARCHIVE_DIR):
@@ -301,24 +351,24 @@ def main():
 
         ingestion_schema_id = get_ingestion_logic_schema_id(conn, INGESTION_LOGIC_VERSION_NUMBER)
         if ingestion_schema_id is None:
-            print(f"Ingestion logic version {INGESTION_LOGIC_VERSION_NUMBER} not found in SchemaVersions.")
-            print("Please run database_setup.py first.")
+            log.error("Ingestion version '%s' not in SchemaVersions. Run database_setup.py first.", INGESTION_LOGIC_VERSION_NUMBER)
             return
-        print(f"Using IngestionSchemaID: {ingestion_schema_id} for Version: {INGESTION_LOGIC_VERSION_NUMBER}")
+        log.info("Using IngestionSchemaID: %s for Version: %s", ingestion_schema_id, INGESTION_LOGIC_VERSION_NUMBER)
 
-        success = process_xml_file(conn, args.xml_file, ingestion_schema_id)
+        success, reason = process_xml_file(conn, args.xml_file, ingestion_schema_id)
 
         if success:
-            print(f"--- Ingestion for {args.xml_file} completed successfully. ---")
+            log.info("--- Ingestion for %s completed successfully. ---", args.xml_file)
         else:
-            print(f"--- Ingestion for {args.xml_file} failed. See logs. ---")
+            log.error("--- Ingestion for %s FAILED: %s ---", args.xml_file, reason)
+            log.error("File moved to %s/ — fix the issue and reimport.", FAILED_DIR)
 
     except Exception as e:
-        print(f"Critical error in main: {e}")
+        log.exception("Critical error in main: %s", e)
     finally:
         if conn:
             conn.close()
-        print("Database connection closed.")
+        log.info("Database connection closed.")
 
 
 if __name__ == "__main__":
